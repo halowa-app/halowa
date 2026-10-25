@@ -1,0 +1,45 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { randomBytes } from 'node:crypto';
+
+const directory = await mkdtemp(path.join(tmpdir(), 'halo-server-'));
+process.env.DATA_FILE = path.join(directory, 'data.json');
+process.env.NODE_ENV = 'test';
+const { server, sweep } = await import('./index.mjs');
+await new Promise(resolve => server.listen(0, resolve));
+const base = `http://127.0.0.1:${server.address().port}/api`;
+const key = () => randomBytes(32).toString('base64');
+const request = async (path, method = 'GET', data, token) => {
+  const response = await fetch(base + path, { method, headers: { ...(data ? { 'Content-Type': 'application/json' } : {}), ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: data ? JSON.stringify(data) : undefined });
+  return { status: response.status, body: await response.json() };
+};
+test('approval gates encrypted chat and location; missed check-in alerts trusted contacts', async () => {
+  const a = await request('/auth/register', 'POST', { handle: 'alice', name: 'Alice', password: 'long-password-a', publicKey: key() });
+  const b = await request('/auth/register', 'POST', { handle: 'bruno', name: 'Bruno', password: 'long-password-b', publicKey: key() });
+  assert.equal(a.status, 201); assert.equal(b.status, 201);
+  const payload = { toId: b.body.user.id, kind: 'chat', nonce: randomBytes(24).toString('base64'), ciphertext: randomBytes(40).toString('base64') };
+  assert.equal((await request('/envelopes', 'POST', payload, a.body.token)).status, 403);
+  assert.equal((await request('/requests', 'POST', { handle: 'bruno' }, a.body.token)).status, 201);
+  const incoming = await request('/requests', 'GET', undefined, b.body.token);
+  assert.equal(incoming.body.incoming.length, 1);
+  assert.equal((await request(`/requests/${incoming.body.incoming[0].id}/accept`, 'POST', {}, b.body.token)).status, 200);
+  assert.equal((await request('/envelopes', 'POST', payload, a.body.token)).status, 201);
+  assert.equal((await request('/envelopes', 'GET', undefined, b.body.token)).body.envelopes.length, 1);
+  const location = { ...payload, kind: 'location' };
+  await request('/envelopes', 'POST', location, a.body.token);
+  assert.equal((await request('/envelopes', 'GET', undefined, b.body.token)).body.envelopes.length, 2);
+  await request('/location/revoke', 'POST', {}, a.body.token);
+  assert.equal((await request('/envelopes', 'GET', undefined, b.body.token)).body.envelopes.length, 1);
+  const config = await request('/safety', 'POST', { enabled: true, intervalHours: 12, contactIds: [b.body.user.id] }, a.body.token);
+  assert.equal(config.status, 200);
+  await sweep(config.body.checkinAt + 14 * 36e5 + 1000);
+  const alerts = await request('/alerts', 'GET', undefined, b.body.token);
+  assert.equal(alerts.body.alerts.length, 1);
+  assert.equal(alerts.body.alerts[0].fromUser.handle, 'alice');
+  await request(`/contacts/${b.body.user.id}`, 'DELETE', undefined, a.body.token);
+  assert.equal((await request('/alerts', 'GET', undefined, b.body.token)).body.alerts.length, 0);
+});
+test.after(async () => { await new Promise(resolve => server.close(resolve)); await rm(directory, { recursive: true, force: true }); });

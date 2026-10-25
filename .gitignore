@@ -1,0 +1,16 @@
+node_modules
+dist
+*.tsbuildinfo
+server/data.json
+server/data.json.tmp
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+*.p12
+*.p8
+*.mobileprovision
+android/.gradle
+android/local.properties
+ios/Pods
