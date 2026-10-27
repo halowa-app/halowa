@@ -27,5 +27,7 @@
 .map-me{position:relative;width:85px;height:56px;border:0;border-radius:0;background:transparent;box-shadow:none;cursor:default}
 .map-me svg{position:absolute;inset:0;width:85px;height:56px;overflow:visible}
 .map-me .map-me-avatar{display:grid;position:absolute;left:41px;top:12px;transform:translate(-50%,-50%);width:42px;height:42px;box-shadow:0 3px 12px #174D9B44;z-index:1}
+.location-interval-setting{flex-wrap:wrap;cursor:default}.location-interval-setting>span{display:grid;gap:4px}.location-interval-setting select{min-width:185px}
+.location-setting-note{margin:0 0 14px;color:#839389;font-size:11px;line-height:1.5}.location-share-settings .setting-row{border-top:1px solid #edf1eb}
 @font-face{font-family:'SF Pro Rounded';src:url('/fonts/SF-Pro-Rounded-Regular.otf') format('opentype');font-style:normal;font-weight:400;font-display:swap}
 .map-page,.map-page h1,.map-page h2,.map-person,.map-me{font-family:'SF Pro Rounded','Outfit',sans-serif;font-synthesis:weight}

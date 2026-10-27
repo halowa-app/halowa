@@ -118,8 +118,13 @@ async function route(req, res) {
     const b = await body(req);
     if (!isContact(user.id, b.toId)) fail(403, 'Contact non approuvé.');
     if (!allowedKinds.has(b.kind) || !b64(b.nonce, 80) || Buffer.from(b.nonce, 'base64').length !== 24 || !b64(b.ciphertext) || Buffer.from(b.ciphertext, 'base64').length < 16) fail(400, 'Message chiffré invalide.');
+    const mode = b.kind === 'location' ? (b.mode ?? 'scheduled') : null;
+    const intervalMs = b.kind === 'location' ? (b.intervalMs ?? 30_000) : 0;
+    if (b.kind === 'location' && (!['continuous', 'on-open', 'scheduled'].includes(mode) || !Number.isInteger(intervalMs) || intervalMs < 15_000 || intervalMs > 12 * 60 * 60_000)) fail(400, 'Mode ou intervalle de position invalide.');
     const now = Date.now();
-    db.envelopes.push({ id: randomUUID(), from: user.id, to: b.toId, kind: b.kind, nonce: b.nonce, ciphertext: b.ciphertext, at: now, expires: b.kind === 'location' ? now + 10 * 60_000 : now + 30 * 864e5 });
+    const locationLifetime = mode === 'on-open' ? 24 * 60 * 60_000 : mode === 'continuous' ? 15 * 60_000 : Math.max(10 * 60_000, intervalMs + 5 * 60_000);
+    if (b.kind === 'location') db.envelopes = db.envelopes.filter(x => !(x.kind === 'location' && x.from === user.id && x.to === b.toId));
+    db.envelopes.push({ id: randomUUID(), from: user.id, to: b.toId, kind: b.kind, nonce: b.nonce, ciphertext: b.ciphertext, at: now, expires: b.kind === 'location' ? now + locationLifetime : now + 30 * 864e5 });
     await save(); return json(res, 201, { ok: true });
   }
   if (method === 'POST' && p === '/api/location/revoke') {

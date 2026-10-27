@@ -5,6 +5,7 @@ const config: CapacitorConfig = {
   appName: 'Halo',
   webDir: 'dist',
   ios: { contentInset: 'always' },
+  android: { useLegacyBridge: true },
 };
 
 export default config;

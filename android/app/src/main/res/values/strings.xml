@@ -4,4 +4,5 @@
     <string name="title_activity_main">Halo</string>
     <string name="package_name">app.halo.mobile</string>
     <string name="custom_url_scheme">app.halo.mobile</string>
+    <string name="capacitor_background_geolocation_notification_channel_name">Partage de position Halo</string>
 </resources>
