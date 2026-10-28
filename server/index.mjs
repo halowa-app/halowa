@@ -3,8 +3,10 @@ import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from
 import { readFile, writeFile, rename } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { createLocationStore, HISTORY_MS } from './location-store.mjs';
 
 const dataFile = process.env.DATA_FILE || path.join(path.dirname(fileURLToPath(import.meta.url)), 'data.json');
+const locationFile = process.env.LOCATION_DB_FILE || `${dataFile}.locations.sqlite`;
 const port = Number(process.env.PORT || 8787);
 const origins = (process.env.CORS_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173').split(',');
 const allowedKinds = new Set(['chat', 'pulse', 'location']);
@@ -12,6 +14,8 @@ const maxBody = 16_000;
 
 let db = { users: [], sessions: [], requests: [], contacts: [], envelopes: [], alerts: [] };
 try { db = JSON.parse(await readFile(dataFile, 'utf8')); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+const locations = createLocationStore(locationFile);
+const viewers = new Map();
 let saveChain = Promise.resolve();
 function save() {
   const snapshot = JSON.stringify(db);
@@ -21,10 +25,23 @@ function save() {
   });
   return saveChain;
 }
+const oldLocations = db.envelopes.filter(item => item.kind === 'location');
+if (oldLocations.length) {
+  for (const item of oldLocations) locations.add({ ...item, mode: 'scheduled', intervalMs: 30_000 });
+  db.envelopes = db.envelopes.filter(item => item.kind !== 'location');
+  await save();
+}
+function pushLocation(recipientId, event, data) {
+  for (const viewer of viewers.get(recipientId) || []) {
+    try { auth(viewer.req); viewer.res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); }
+    catch { viewer.res.end(); }
+  }
+}
 const hash = value => createHash('sha256').update(value).digest('hex');
 const publicUser = user => ({ id: user.id, handle: user.handle, name: user.name, publicKey: user.publicKey });
 const pairKey = (a, b) => [a, b].sort().join(':');
 const isContact = (a, b) => db.contacts.some(x => x.key === pairKey(a, b));
+const maySeeLocation = (from, to) => isContact(from, to) && db.users.find(x => x.id === from)?.locationShare?.ids.includes(to);
 const json = (res, status, body) => {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(body));
@@ -90,7 +107,12 @@ async function route(req, res) {
   if (method === 'DELETE' && p.startsWith('/api/contacts/')) {
     const target = p.slice(14);
     db.contacts = db.contacts.filter(x => x.key !== pairKey(user.id, target));
-    db.envelopes = db.envelopes.filter(x => !(x.kind === 'location' && ((x.from === user.id && x.to === target) || (x.to === user.id && x.from === target))));
+    locations.deletePair(user.id, target);
+    if (user.locationShare) user.locationShare.ids = user.locationShare.ids.filter(id => id !== target);
+    const other = findUser(target);
+    if (other?.locationShare) other.locationShare.ids = other.locationShare.ids.filter(id => id !== user.id);
+    pushLocation(target, 'revoke', { from: user.id });
+    pushLocation(user.id, 'revoke', { from: target });
     user.safety.contactIds = user.safety.contactIds.filter(x => x !== target);
     await save(); return json(res, 200, { ok: true });
   }
@@ -114,6 +136,17 @@ async function route(req, res) {
     if (action[2] === 'accept') db.contacts.push({ key: pairKey(invite.from, invite.to), a: invite.from, b: invite.to, at: Date.now() });
     await save(); return json(res, 200, { ok: true });
   }
+  if (method === 'POST' && p === '/api/location/start') {
+    const b = await body(req);
+    const ids = [...new Set(Array.isArray(b.ids) ? b.ids : [])];
+    if (typeof b.shareId !== 'string' || !/^[0-9a-f-]{36}$/i.test(b.shareId) || !ids.length || ids.length > 50 || ids.some(id => typeof id !== 'string' || !isContact(user.id, id))) fail(400, 'Partage de position invalide.');
+    for (const recipientId of locations.recipientsOf(user.id)) if (!ids.includes(recipientId)) {
+      locations.deleteRecipient(user.id, recipientId);
+      pushLocation(recipientId, 'revoke', { from: user.id });
+    }
+    user.locationShare = { id: b.shareId, ids, at: Date.now() };
+    await save(); return json(res, 200, { ok: true });
+  }
   if (method === 'POST' && p === '/api/envelopes') {
     const b = await body(req);
     if (!isContact(user.id, b.toId)) fail(403, 'Contact non approuvé.');
@@ -121,20 +154,56 @@ async function route(req, res) {
     const mode = b.kind === 'location' ? (b.mode ?? 'scheduled') : null;
     const intervalMs = b.kind === 'location' ? (b.intervalMs ?? 30_000) : 0;
     if (b.kind === 'location' && (!['continuous', 'on-open', 'scheduled'].includes(mode) || !Number.isInteger(intervalMs) || intervalMs < 15_000 || intervalMs > 12 * 60 * 60_000)) fail(400, 'Mode ou intervalle de position invalide.');
+    if (b.kind === 'location' && (user.locationShare?.id !== b.shareId || !user.locationShare.ids.includes(b.toId))) fail(403, 'Partage de position inactif.');
     const now = Date.now();
     const locationLifetime = mode === 'on-open' ? 24 * 60 * 60_000 : mode === 'continuous' ? 15 * 60_000 : Math.max(10 * 60_000, intervalMs + 5 * 60_000);
-    if (b.kind === 'location') db.envelopes = db.envelopes.filter(x => !(x.kind === 'location' && x.from === user.id && x.to === b.toId));
-    db.envelopes.push({ id: randomUUID(), from: user.id, to: b.toId, kind: b.kind, nonce: b.nonce, ciphertext: b.ciphertext, at: now, expires: b.kind === 'location' ? now + locationLifetime : now + 30 * 864e5 });
+    if (b.kind === 'location') {
+      const item = { id: randomUUID(), from: user.id, to: b.toId, kind: 'location', nonce: b.nonce, ciphertext: b.ciphertext, mode, intervalMs, at: now, expires: now + locationLifetime };
+      locations.add(item);
+      pushLocation(b.toId, 'location', item);
+      return json(res, 201, { ok: true });
+    }
+    db.envelopes.push({ id: randomUUID(), from: user.id, to: b.toId, kind: b.kind, nonce: b.nonce, ciphertext: b.ciphertext, at: now, expires: now + 30 * 864e5 });
     await save(); return json(res, 201, { ok: true });
   }
   if (method === 'POST' && p === '/api/location/revoke') {
-    db.envelopes = db.envelopes.filter(x => !(x.kind === 'location' && x.from === user.id));
-    await save(); return json(res, 200, { ok: true });
+    const recipients = locations.recipientsOf(user.id);
+    user.locationShare = null;
+    locations.deleteSender(user.id);
+    for (const id of recipients) pushLocation(id, 'revoke', { from: user.id });
+    await save();
+    return json(res, 200, { ok: true });
+  }
+  if (method === 'GET' && p === '/api/location/stream') {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+    let subscribers = viewers.get(user.id);
+    if (!subscribers) { subscribers = new Set(); viewers.set(user.id, subscribers); }
+    const viewer = { req, res };
+    subscribers.add(viewer);
+    res.write(`event: snapshot\ndata: ${JSON.stringify(locations.latestFor(user.id, Date.now(), maySeeLocation))}\n\n`);
+    const keepalive = setInterval(() => { try { auth(req); if (!res.destroyed) res.write(': keepalive\n\n'); } catch { res.end(); } }, 25_000);
+    req.on('close', () => {
+      clearInterval(keepalive);
+      subscribers.delete(viewer);
+      if (!subscribers.size) viewers.delete(user.id);
+    });
+    return;
+  }
+  if (method === 'GET' && p === '/api/location/history') {
+    const senderId = url.searchParams.get('from');
+    if (!senderId || !isContact(user.id, senderId)) fail(403, 'Contact non approuvé.');
+    const now = Date.now();
+    if (!locations.latestFor(user.id, now, maySeeLocation).some(item => item.from === senderId)) return json(res, 200, { envelopes: [] });
+    const requestedSince = Number(url.searchParams.get('since'));
+    const requestedBefore = Number(url.searchParams.get('before'));
+    const since = Number.isFinite(requestedSince) && requestedSince > 0 ? Math.max(now - HISTORY_MS, requestedSince) : now - HISTORY_MS;
+    const before = Number.isFinite(requestedBefore) && requestedBefore > 0 ? Math.min(now + 1, requestedBefore) : now + 1;
+    return json(res, 200, { envelopes: locations.historyFor(user.id, senderId, since, before, 1440) });
   }
   if (method === 'GET' && p === '/api/envelopes') {
     const after = Math.max(0, Number(url.searchParams.get('after')) || 0);
     const now = Date.now();
-    const envelopes = db.envelopes.filter(x => (x.from === user.id || x.to === user.id) && x.at > after && x.expires > now && isContact(x.from, x.to));
+    const envelopes = db.envelopes.filter(x => x.kind !== 'location' && (x.from === user.id || x.to === user.id) && x.at > after && x.expires > now && isContact(x.from, x.to));
     return json(res, 200, { envelopes });
   }
   if (method === 'POST' && p === '/api/checkin') {
@@ -172,11 +241,12 @@ export async function sweep(now = Date.now()) {
   const n = db.envelopes.length;
   db.envelopes = db.envelopes.filter(x => x.expires > now);
   if (db.envelopes.length !== n) changed = true;
+  locations.prune(now);
   if (changed) await save();
 }
 const server = http.createServer(async (req, res) => {
   const origin = req.headers.origin;
-  if (origin && (origins.includes(origin) || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin))) {
+  if (origin && (origins.includes(origin) || origin === 'capacitor://localhost' || /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin))) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
@@ -190,4 +260,4 @@ if (process.env.NODE_ENV !== 'test') {
   server.listen(port, host, () => console.log(`Halo API : http://${host}:${port}`));
   setInterval(() => sweep().catch(console.error), 60_000).unref();
 }
-export { server };
+export { server, locations };

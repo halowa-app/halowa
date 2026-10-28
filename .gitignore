@@ -3,6 +3,7 @@ dist
 *.tsbuildinfo
 server/data.json
 server/data.json.tmp
+server/*.sqlite*
 .env
 .env.*
 !.env.example

@@ -4,7 +4,7 @@ Halo est un prototype fonctionnel de cercle de confiance : carte OpenStreetMap, 
 
 ## Essayer l’application
 
-Prévoir Node.js 22 ou plus récent.
+Prévoir Node.js 24 ou plus récent (SQLite intégré à Node).
 
 ```powershell
 npm install
@@ -19,7 +19,7 @@ npm run dev
 
 Ouvrir `http://localhost:5173`, puis **Explorer la démo**. Cette démo utilise uniquement des personnes fictives. Pour tester entre deux comptes réels, créer deux comptes dans deux profils de navigateur distincts, envoyer une invitation par identifiant et l’accepter sur le second compte.
 
-Le serveur conserve les comptes et les enveloppes chiffrées dans `server/data.json`. Ce fichier est ignoré par Git. Sauvegarder ce fichier si l’on souhaite préserver les données de test.
+Le serveur conserve les comptes et les messages chiffrés dans `server/data.json`, et l’historique chiffré des positions dans `server/data.json.locations.sqlite`. Ces fichiers sont ignorés par Git. Arrêter le serveur avant de copier les deux fichiers pour sauvegarder les données de test.
 
 ## Installer sur Android et iOS
 
@@ -38,19 +38,23 @@ Dans **Réglages → Mode de partage de position**, choisir : **En continu**, **
 
 Sur iOS et Android, les modes continu et programmé demandent la localisation en arrière-plan. Android affiche une notification persistante et demande sa permission. La fréquence choisie est une cible : le système peut retarder ou interrompre les événements, notamment si l’app est fermée de force, si le téléphone reste immobile ou si la batterie est économisée. Ces modes doivent être validés sur de vrais appareils avant un usage réel.
 
+Le téléphone partageant envoie toujours ses relevés chiffrés au serveur à la fréquence choisie, même si aucun contact ne regarde la carte. Le serveur conserve l’historique chiffré **7 jours** dans SQLite, puis le supprime automatiquement. La position actuelle est diffusée au contact choisi uniquement pendant que sa carte est ouverte au premier plan. Le contact peut toucher un avatar pour voir son parcours, jour par jour ; la carte ne demande alors que les positions de ce contact pour la période affichée. Arrêter le partage efface immédiatement l’historique partagé si le serveur est joignable. Si le téléphone est hors ligne, Halo enregistre la demande d’effacement et la réessaie ; entre-temps, l’accès au parcours cesse au plus tard lorsque la dernière position devient périmée.
+
+Cette règle « seulement quand la carte est ouverte » décrit le comportement de l’app : un contact déjà approuvé qui possède ses identifiants et sa clé de déchiffrement pourrait interroger directement l’API pendant que le partage est actif. Le serveur ne peut pas prouver qu’une carte est réellement affichée sur son appareil.
+
 ## Fonctionnement de la confidentialité
 
 - Une invitation doit être acceptée avant tout échange.
 - Les messages, signaux et coordonnées sont chiffrés sur l’appareil avec TweetNaCl `box` avant envoi. Le serveur ne stocke que les enveloppes chiffrées, les identifiants d’expéditeur et destinataire, le type et l’heure.
 - La clé privée est placée dans Keychain sur iOS ou Keystore sur Android par `capacitor-secure-storage`. La version navigateur stocke la clé localement **sans protection équivalente** ; elle est réservée à la démonstration et au développement.
 - Les codes de clés affichés dans la conversation et les réglages permettent une vérification manuelle entre proches. Il n’existe pas encore de sauvegarde ou transfert de clé entre appareils.
-- Une position reçue expire selon le mode : 15 minutes en continu, 24 heures après une ouverture, ou à l’intervalle programmé augmenté de 5 minutes (avec un minimum de 10 minutes). Le bouton d’arrêt demande aussi son retrait immédiat au serveur. Sans connexion au moment de l’arrêt, la dernière position peut rester visible jusqu’à son expiration.
+- Une position actuelle expire selon le mode : 15 minutes en continu, 24 heures après une ouverture, ou à l’intervalle programmé augmenté de 5 minutes (avec un minimum de 10 minutes). L’historique chiffré est conservé 7 jours, mais n’est consultable par un contact que tant que sa dernière position est encore actuelle. L’arrêt demande l’effacement de toutes les positions au serveur ; sans connexion, il sera réessayé.
 - Les envois de position restent chiffrés sur l’appareil. Le mode et l’intervalle sont transmis au serveur en clair pour définir l’expiration. Les clés et le contenu des coordonnées ne lui sont pas transmis en clair.
 - La veille de sécurité déclenche une alerte **dans l’application** après l’intervalle choisi, augmenté de 2 heures de grâce. Le contact doit ouvrir Halo pour la voir. Il n’y a pas encore de notification push, SMS ou appel automatique.
 
 ## Limites avant un lancement public
 
-Ce prototype doit être renforcé avant un usage comme dispositif de sécurité : serveur avec base de données transactionnelle et sauvegardes, vérification des comptes, limitation du nombre de tentatives de connexion, récupération sécurisée des clés, notifications APNs/FCM, tests sur appareils réels, audit du protocole de chiffrement, surveillance et disponibilité du serveur. Une absence de pointage ne constitue jamais une preuve de danger. Halo ne remplace pas les services d’urgence.
+Ce prototype doit être renforcé avant un usage comme dispositif de sécurité : migration du reste des données serveur vers une base transactionnelle et sauvegardes, vérification des comptes, limitation du nombre de tentatives de connexion, récupération sécurisée des clés, notifications APNs/FCM, tests sur appareils réels, audit du protocole de chiffrement, surveillance et disponibilité du serveur. Une absence de pointage ne constitue jamais une preuve de danger. Halo ne remplace pas les services d’urgence.
 
 La carte emploie [OpenStreetMap](https://www.openstreetmap.org/copyright) via [OpenFreeMap](https://openfreemap.org/quick_start/) et [MapLibre](https://maplibre.org/), sans service Google. Son style local `public/map-style.json` utilise des couleurs relevées sur les captures de Plans fournies pour ce projet : eau cyan, parcs vert clair, zones urbaines beige et routes grises à cœur blanc. Le dégradé bleu en SVG fourni apparaît derrière l’avatar de l’utilisateur à sa position exacte. Le mode démonstration affiche une position fictive pour permettre de voir ce repère sans autoriser la géolocalisation. Prévoir un hébergement de tuiles adapté au trafic avant un déploiement à grande échelle.
 

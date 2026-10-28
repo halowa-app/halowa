@@ -1,16 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Geolocation } from '@capacitor/geolocation';
+import { App as CapacitorApp } from '@capacitor/app';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { Capacitor } from '@capacitor/core';
 import * as maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
+import mapWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 import { ArrowLeft, ArrowRight, Check, CheckCheck, ChevronDown, ChevronRight, CircleHelp, Clock3, Compass, Copy, Heart, HeartPulse, LockKeyhole, MapPin, MessageCircle, MoreHorizontal, Navigation, Plus, Radio, Search, Send, Settings2, ShieldCheck, Sparkles, UserPlus, Users, X } from 'lucide-react';
-import { api, fingerprint, getApiUrl, isNative, loadIdentity, loadSession, loadShareSession, makeKeys, open, saveIdentity, saveSession, saveShareSession, seal, setApiUrl, type AlertItem, type Envelope, type Person, type Safety, type Session, type ShareMode, type ShareSession } from './lib';
+import { api, fingerprint, getApiUrl, isNative, loadIdentity, loadPendingLocationRevoke, loadSession, loadShareSession, makeKeys, open, saveIdentity, savePendingLocationRevoke, saveSession, saveShareSession, seal, setApiUrl, type AlertItem, type Envelope, type Person, type Safety, type Session, type ShareMode, type ShareSession } from './lib';
 import { watchSharedLocation } from './locationShare';
+import { subscribeToLocations } from './locationStream';
+
+maplibregl.setWorkerUrl(mapWorkerUrl);
 
 type Tab = 'map' | 'signals' | 'chats' | 'circle' | 'safety';
 type Decrypted = Envelope & { body: any };
-type Position = { lat: number; lng: number; at: number };
+type Position = { lat: number; lng: number; at: number; expires?: number };
 const demoPeople: Person[] = [
   { id: 'demo-1', handle: 'lea', name: 'Léa', publicKey: '' },
   { id: 'demo-2', handle: 'camille', name: 'Camille', publicKey: '' },
@@ -59,13 +64,13 @@ function Avatar({ person, size = 'md', index = 0 }: { person: Person; size?: 'sm
 }
 
 function LocationShareSettings({ mode, intervalMs, onModeChange, onIntervalChange }: { mode: ShareMode; intervalMs: number; onModeChange: (mode: ShareMode) => void; onIntervalChange: (ms: number) => void }) {
-  return <div className="location-share-settings"><label className="setting-row location-interval-setting"><span><strong>Mode de partage de position</strong><small>Choisissez quand vos contacts reçoivent une nouvelle position.</small></span><select aria-label="Mode de partage de position" value={mode} onChange={event => onModeChange(event.target.value as ShareMode)}>{Object.entries(shareModeLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label>{mode === 'scheduled' && <label className="setting-row location-interval-setting"><span><strong>Fréquence programmée</strong><small>De 15 secondes à 12 heures.</small></span><select aria-label="Fréquence programmée" value={intervalMs} onChange={event => onIntervalChange(Number(event.target.value))}>{shareIntervals.map(option => <option key={option.ms} value={option.ms}>{option.label}</option>)}</select></label>}<p className="location-setting-note">Ces choix s’appliquent au prochain partage. Le suivi en arrière-plan dépend des autorisations du téléphone ; les intervalles peuvent varier.</p></div>;
+  return <div className="location-share-settings"><label className="setting-row location-interval-setting"><span><strong>Mode de partage de position</strong><small>Choisissez quand Halo enregistre une nouvelle position.</small></span><select aria-label="Mode de partage de position" value={mode} onChange={event => onModeChange(event.target.value as ShareMode)}>{Object.entries(shareModeLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select></label>{mode === 'scheduled' && <label className="setting-row location-interval-setting"><span><strong>Fréquence programmée</strong><small>De 15 secondes à 12 heures.</small></span><select aria-label="Fréquence programmée" value={intervalMs} onChange={event => onIntervalChange(Number(event.target.value))}>{shareIntervals.map(option => <option key={option.ms} value={option.ms}>{option.label}</option>)}</select></label>}<p className="location-setting-note">Ces choix s’appliquent au prochain partage. Les positions chiffrées restent sur le serveur 7 jours et ne sont transmises aux contacts choisis que lorsqu’ils regardent la carte. Arrêter le partage efface l’historique. En arrière-plan, les intervalles peuvent varier.</p></div>;
 }
 
-function MapCanvas({ people, positions, own, ownName, onLocate }: { people: Person[]; positions: Record<string, Position>; own: Position | null; ownName: string; onLocate: () => void }) {
+function MapCanvas({ people, positions, own, ownName, trail, onPersonSelect, onLocate }: { people: Person[]; positions: Record<string, Position>; own: Position | null; ownName: string; trail: Position[]; onPersonSelect: (person: Person) => void; onLocate: () => void }) {
   const container = useRef<HTMLDivElement>(null);
   const map = useRef<maplibregl.Map | null>(null);
-  const markers = useRef<maplibregl.Marker[]>([]);
+  const markers = useRef(new Map<string, maplibregl.Marker>());
   const [mapReady, setMapReady] = useState(false);
   useEffect(() => {
     if (!container.current) return;
@@ -80,22 +85,37 @@ function MapCanvas({ people, positions, own, ownName, onLocate }: { people: Pers
       map.current = instance;
     };
     void initialize();
-    return () => { active = false; instance?.remove(); map.current = null; };
+    return () => { active = false; markers.current.forEach(marker => marker.remove()); markers.current.clear(); instance?.remove(); map.current = null; };
   }, []);
   useEffect(() => {
     if (!map.current || !mapReady) return;
-    markers.current.forEach(marker => marker.remove());
-    markers.current = [];
+    const nextMarkers = new Map<string, maplibregl.Marker>();
     people.forEach((person, index) => {
       const position = positions[person.id];
-      if (!position || Date.now() - position.at > 10 * 60_000) return;
+      if (!position || (position.expires ?? position.at + 10 * 60_000) <= Date.now()) return;
+      const existing = markers.current.get(person.id);
+      if (existing) {
+        existing.getPopup()?.setText(`${person.name} · position partagée ${ago(position.at)}`);
+        const previous = existing.getLngLat();
+        if (previous.lng !== position.lng || previous.lat !== position.lat) {
+          existing.getElement().classList.add('map-person-moving');
+          existing.setLngLat([position.lng, position.lat]);
+          window.setTimeout(() => existing.getElement().classList.remove('map-person-moving'), 1800);
+        }
+        nextMarkers.set(person.id, existing);
+        return;
+      }
       const node = document.createElement('div');
       node.className = `map-person map-person-${index % 5}`;
       node.innerHTML = `<span>${initials(person.name)}</span>`;
       node.setAttribute('aria-label', person.name);
-      markers.current.push(new maplibregl.Marker({ element: node }).setLngLat([position.lng, position.lat]).setPopup(new maplibregl.Popup({ offset: 18 }).setText(`${person.name} · position partagée ${ago(position.at)}`)).addTo(map.current!));
+      node.addEventListener('click', () => onPersonSelect(person));
+      nextMarkers.set(person.id, new maplibregl.Marker({ element: node }).setLngLat([position.lng, position.lat]).setPopup(new maplibregl.Popup({ offset: 18 }).setText(`${person.name} · position partagée ${ago(position.at)}`)).addTo(map.current!));
     });
     if (own) {
+      const existingOwn = markers.current.get('__own__');
+      if (existingOwn) { existingOwn.setLngLat([own.lng, own.lat]); nextMarkers.set('__own__', existingOwn); }
+      else {
       const node = document.createElement('div');
       node.className = 'map-me';
       node.setAttribute('aria-label', `${ownName} · ma position exacte`);
@@ -104,9 +124,22 @@ function MapCanvas({ people, positions, own, ownName, onLocate }: { people: Pers
       avatar.className = 'avatar avatar-md avatar-0 map-me-avatar';
       avatar.textContent = initials(ownName);
       node.append(avatar);
-      markers.current.push(new maplibregl.Marker({ element: node, anchor: 'top', offset: [0, -12] }).setLngLat([own.lng, own.lat]).addTo(map.current));
+      nextMarkers.set('__own__', new maplibregl.Marker({ element: node, anchor: 'top', offset: [0, -12] }).setLngLat([own.lng, own.lat]).addTo(map.current));
+      }
     }
-  }, [people, positions, own, ownName, mapReady]);
+    for (const [id, marker] of markers.current) if (!nextMarkers.has(id)) marker.remove();
+    markers.current = nextMarkers;
+  }, [people, positions, own, ownName, mapReady, onPersonSelect]);
+  useEffect(() => {
+    const instance = map.current;
+    if (!instance || !mapReady) return;
+    const sourceId = 'halo-history-trail';
+    const feature = { type: 'Feature' as const, properties: {}, geometry: { type: 'LineString' as const, coordinates: trail.map(point => [point.lng, point.lat]) } };
+    if (!instance.getSource(sourceId)) {
+      instance.addSource(sourceId, { type: 'geojson', data: feature });
+      instance.addLayer({ id: sourceId, type: 'line', source: sourceId, paint: { 'line-color': '#578fe5', 'line-width': 4, 'line-opacity': 0.85 }, layout: { 'line-cap': 'round', 'line-join': 'round' } });
+    } else (instance.getSource(sourceId) as maplibregl.GeoJSONSource).setData(feature);
+  }, [trail, mapReady]);
   return <><div className="map-canvas" ref={container} /><button className="locate-button" onClick={() => { onLocate(); if (own && map.current) map.current.flyTo({ center: [own.lng, own.lat], zoom: 14.5 }); }} title="Me localiser"><Navigation size={19} /></button></>;
 }
 
@@ -144,6 +177,18 @@ export default function App() {
   const [incoming, setIncoming] = useState<{ id: string; from: Person }[]>([]);
   const [outgoing, setOutgoing] = useState<{ id: string; to: Person }[]>([]);
   const [envelopes, setEnvelopes] = useState<Decrypted[]>([]);
+  const [locationEnvelopes, setLocationEnvelopes] = useState<Decrypted[]>([]);
+  const [documentVisible, setDocumentVisible] = useState(document.visibilityState === 'visible');
+  const [nativeActive, setNativeActive] = useState(true);
+  const appVisible = documentVisible && nativeActive;
+  const [mapNow, setMapNow] = useState(Date.now());
+  const [historyFrom, setHistoryFrom] = useState<string | null>(null);
+  const historyFromRef = useRef<string | null>(null);
+  historyFromRef.current = historyFrom;
+  const [historyDay, setHistoryDay] = useState(0);
+  const [historyTrail, setHistoryTrail] = useState<Position[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const pendingRevokeInFlight = useRef<Promise<void> | null>(null);
   const [demoMessages, setDemoMessages] = useState<Decrypted[]>([]);
   const [alerts, setAlerts] = useState<AlertItem[]>([]);
   const [safety, setSafety] = useState<Safety>({ enabled: false, intervalHours: 24, contactIds: [] });
@@ -185,11 +230,13 @@ export default function App() {
   const user = session?.user || { id: 'demo-me', name: 'Alex', handle: 'alex', publicKey: '' };
   const people = demo ? demoPeople : contacts;
   const shareDescription = shareMode === 'on-open'
-    ? 'Une nouvelle position est envoyée lorsque vous ouvrez Halo. La dernière position reste visible au plus 24 heures. Vous pouvez arrêter à tout moment.'
+    ? 'Une nouvelle position est enregistrée lorsque vous ouvrez Halo. La dernière position reste visible au plus 24 heures. Vous pouvez arrêter à tout moment.'
     : shareMode === 'continuous'
       ? 'Halo actualise votre position en continu, y compris en arrière-plan si le téléphone l’autorise. Vous pouvez arrêter à tout moment.'
-      : `Halo vise un envoi ${shareIntervals.find(option => option.ms === shareIntervalMs)?.label.toLowerCase() || 'à la fréquence choisie'}, y compris en arrière-plan. Le téléphone peut retarder les mises à jour. Vous pouvez arrêter à tout moment.`;
-  const positions: Record<string, Position> = demo ? demoPositions : Object.fromEntries(envelopes.filter(x => x.kind === 'location' && typeof x.body?.lat === 'number' && typeof x.body?.lng === 'number' && x.expires > Date.now()).map(x => [x.from, { lat: x.body.lat, lng: x.body.lng, at: x.at }]));
+      : `Halo vise un relevé ${shareIntervals.find(option => option.ms === shareIntervalMs)?.label.toLowerCase() || 'à la fréquence choisie'}, y compris en arrière-plan. Le téléphone peut retarder les mises à jour. Vous pouvez arrêter à tout moment.`;
+  const positions: Record<string, Position> = demo ? demoPositions : Object.fromEntries(locationEnvelopes.filter(x => typeof x.body?.lat === 'number' && typeof x.body?.lng === 'number' && x.expires > mapNow).map(x => [x.from, { lat: x.body.lat, lng: x.body.lng, at: x.at, expires: x.expires }]));
+  const historyPerson = historyFrom ? people.find(person => person.id === historyFrom) : null;
+  const selectMapPerson = useCallback((person: Person) => { setHistoryFrom(person.id); setHistoryDay(0); }, []);
   const notes = demo ? [
     { id: 'n1', from: 'demo-1', to: 'demo-me', kind: 'pulse', at: Date.now() - 13 * 60_000, body: { text: 'Je suis bien arrivée.' } },
     { id: 'n2', from: 'demo-2', to: 'demo-me', kind: 'pulse', at: Date.now() - 64 * 60_000, body: { text: 'Je pense à toi.' } },
@@ -211,35 +258,115 @@ export default function App() {
       return true;
     } catch (error) { if ((error as Error).message === 'Session expirée.') { setSession(null); setSharing(null); await saveSession(null); await saveShareSession(null); return false; } return true; }
   }, []);
+  const revokePending = useCallback((current: Session) => {
+    if (pendingRevokeInFlight.current) return pendingRevokeInFlight.current;
+    const operation = (async () => {
+      if (await loadPendingLocationRevoke() !== current.user.id) return;
+      await api('/location/revoke', 'POST', {}, current.token);
+      await savePendingLocationRevoke(null);
+    })();
+    pendingRevokeInFlight.current = operation;
+    void operation.then(() => { pendingRevokeInFlight.current = null; }, () => { pendingRevokeInFlight.current = null; });
+    return operation;
+  }, []);
   const stopSharing = useCallback(async () => {
     setSharing(null);
+    let pendingRecorded = true;
+    if (session && !demo) { try { await savePendingLocationRevoke(session.user.id); } catch { pendingRecorded = false; } }
     let localCleared = true;
     try { await saveShareSession(null); } catch { localCleared = false; }
     let serverCleared = true;
     if (session && !demo) {
-      try { await api('/location/revoke', 'POST', {}, session.token); }
+      try { if (pendingRecorded) await revokePending(session); else await api('/location/revoke', 'POST', {}, session.token); }
       catch { serverCleared = false; }
     }
     if (!localCleared) { flash('Le partage a cessé ici, mais son arrêt n’a pas pu être enregistré sur cet appareil. Réessayez.'); return false; }
-    if (!serverCleared) { flash('Le partage a cessé sur cet appareil, mais la dernière position peut rester visible jusqu’à expiration. Vérifiez la connexion.'); return false; }
+    if (!pendingRecorded && !serverCleared) { flash('Le partage a cessé ici, mais l’effacement distant n’a pas pu être demandé. Réessayez avec une connexion.'); return false; }
+    if (!serverCleared) { flash('Le partage a cessé ici. Sans réseau, la position et son historique peuvent rester accessibles jusqu’à expiration. Halo réessaiera l’effacement.'); return false; }
     return true;
-  }, [session, demo]);
+  }, [session, demo, revokePending]);
   useEffect(() => {
     let active = true;
     void (async () => {
       const saved = await loadSession();
       if (saved && await refresh(saved)) {
         const remembered = await loadShareSession();
+        const pendingRevoke = await loadPendingLocationRevoke();
+        if (remembered && typeof remembered.shareId !== 'string') {
+          await saveShareSession(null).catch(() => {});
+          if (active) flash('Le partage précédent doit être réactivé après cette mise à jour.');
+        }
         if (active) {
           setSession(saved);
-          if (remembered?.userId === saved.user.id && remembered.ids.length && ['continuous', 'on-open', 'scheduled'].includes(remembered.mode)) setSharing(remembered);
+          if (pendingRevoke !== saved.user.id && remembered?.userId === saved.user.id && typeof remembered.shareId === 'string' && remembered.ids.length && ['continuous', 'on-open', 'scheduled'].includes(remembered.mode)) setSharing(remembered);
         }
       }
       if (active) setLoading(false);
     })().catch(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [refresh]);
-  useEffect(() => { if (!session || demo) return; const timer = window.setInterval(() => refresh(session), 7000); return () => window.clearInterval(timer); }, [session, demo, refresh]);
+  useEffect(() => {
+    if (!session || demo) return;
+    let active = true;
+    const retry = async () => {
+      if (!active || await loadPendingLocationRevoke() !== session.user.id) return;
+      try { await revokePending(session); }
+      catch { /* Try again when the app reconnects. */ }
+    };
+    void retry();
+    const timer = window.setInterval(() => { void retry(); }, 30_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [session, demo, revokePending]);
+  useEffect(() => { if (!session || demo) return; void refresh(session); const timer = window.setInterval(() => { void refresh(session); }, tab === 'map' ? 60_000 : 7000); return () => window.clearInterval(timer); }, [session, demo, tab, refresh]);
+  useEffect(() => {
+    const onVisibility = () => setDocumentVisible(document.visibilityState === 'visible');
+    document.addEventListener('visibilitychange', onVisibility);
+    const listener = CapacitorApp.addListener('appStateChange', ({ isActive }) => setNativeActive(isActive));
+    return () => { document.removeEventListener('visibilitychange', onVisibility); void listener.then(handle => handle.remove()).catch(() => {}); };
+  }, []);
+  useEffect(() => { const timer = window.setInterval(() => setMapNow(Date.now()), 60_000); return () => window.clearInterval(timer); }, []);
+  useEffect(() => {
+    if (!session || demo || tab !== 'map' || !appVisible) return;
+    const decrypt = (item: Envelope): Decrypted | null => {
+      const person = contactsRef.current.find(contact => contact.id === item.from);
+      const body = person ? open(item, person.publicKey, session.secretKey) : null;
+      return body ? { ...item, body } : null;
+    };
+    return subscribeToLocations(session, {
+      snapshot: items => setLocationEnvelopes(items.map(decrypt).filter((item): item is Decrypted => item !== null)),
+      location: item => {
+        const next = decrypt(item);
+        if (next) { setMapNow(Date.now()); setLocationEnvelopes(old => [...old.filter(previous => previous.from !== next.from), next]); }
+      },
+      revoke: senderId => {
+        setLocationEnvelopes(old => old.filter(item => item.from !== senderId));
+        if (historyFromRef.current === senderId) { setHistoryTrail([]); setHistoryFrom(null); }
+      },
+    });
+  }, [session, demo, tab, appVisible]);
+  useEffect(() => {
+    if (!historyFrom || tab !== 'map' || !appVisible) return;
+    if (demo) {
+      const point = historyDay === 0 ? demoPositions[historyFrom] : null;
+      setHistoryTrail(point ? [{ ...point, lat: point.lat - .008, lng: point.lng - .01 }, { ...point, lat: point.lat - .004, lng: point.lng - .005 }, point] : []);
+      return;
+    }
+    if (!session) return;
+    let active = true;
+    setHistoryLoading(true);
+    const now = Date.now();
+    const since = now - (historyDay + 1) * 864e5;
+    const before = now - historyDay * 864e5;
+    void api<{ envelopes: Envelope[] }>(`/location/history?from=${encodeURIComponent(historyFrom)}&since=${since}&before=${before}`, 'GET', undefined, session.token)
+      .then(result => {
+        if (!active) return;
+        const person = contactsRef.current.find(contact => contact.id === historyFrom);
+        setHistoryTrail(person ? result.envelopes.map(item => ({ item, body: open(item, person.publicKey, session.secretKey) as { lat?: number; lng?: number } | null })).filter(({ body }) => typeof body?.lat === 'number' && typeof body?.lng === 'number').map(({ item, body }) => ({ lat: body!.lat!, lng: body!.lng!, at: item.at })) : []);
+      })
+      .catch(() => { if (active) setHistoryTrail([]); })
+      .finally(() => { if (active) setHistoryLoading(false); });
+    return () => { active = false; };
+  }, [historyFrom, historyDay, session, demo, tab, appVisible]);
   useEffect(() => {
     if (!sharing || !session || demo) return;
     return watchSharedLocation(sharing, session, id => contactsRef.current.find(person => person.id === id), setOwnPosition, message => { void stopSharing().then(revoked => { if (revoked) flash(message); }); });
@@ -297,12 +424,19 @@ export default function App() {
     if (!selectedIds.length) { flash('Sélectionnez au moins un contact.'); return; }
     if (demo) { setShareModal(false); flash('Le partage est simulé dans cet aperçu.'); return; }
     if (!session) return;
+    await revokePending(session);
     if (isNative && shareMode !== 'on-open' && Capacitor.getPlatform() === 'android') {
       const permission = await LocalNotifications.requestPermissions();
       if (permission.display !== 'granted') throw new Error('Autorisez les notifications pour garder le partage actif en arrière-plan.');
     }
-    const next: ShareSession = { userId: session.user.id, ids: [...selectedIds], mode: shareMode, intervalMs: shareIntervalMs };
-    await saveShareSession(next);
+    const next: ShareSession = { userId: session.user.id, shareId: crypto.randomUUID(), ids: [...selectedIds], mode: shareMode, intervalMs: shareIntervalMs };
+    await api('/location/start', 'POST', { shareId: next.shareId, ids: next.ids }, session.token);
+    try { await saveShareSession(next); }
+    catch (error) {
+      await savePendingLocationRevoke(session.user.id).catch(() => {});
+      await revokePending(session).catch(() => {});
+      throw error;
+    }
     setSharing(next);
     setShareModal(false);
     flash(`Partage activé · ${shareModeLabels[shareMode].toLowerCase()}.`);
@@ -328,7 +462,7 @@ export default function App() {
     <main className="main-content">
       <header className="topbar"><div className="breadcrumb">HALO <ChevronRight size={14} /> <strong>{nav.find(x => x.key === tab)?.label}</strong></div><div className="topbar-actions">{demo && <span className="demo-chip">MODE DÉMO</span>}<span className="privacy-chip"><LockKeyhole size={14} /> Espace privé</span><button className="profile-top" onClick={() => setSettingsOpen(true)}><Avatar person={user} size="sm" /><ChevronDown size={15} /></button></div></header>
 
-      {tab === 'map' && <div className="map-page"><div className="map-layer"><MapCanvas people={people} positions={positions} own={demo ? demoOwnPosition : ownPosition} ownName={user.name} onLocate={locate} /></div><div className="map-top"><div className="map-title"><div className="eyebrow"><span className="eyebrow-dot" /> VOTRE MONDE EN UN COUP D’ŒIL</div><h1>On est mieux<br /><em>ensemble.</em></h1><p>Retrouvez les personnes qui choisissent de partager leur position avec vous.</p></div><div className="map-status"><span className={`status-light ${sharing ? 'on' : ''}`} /><div><strong>{sharing ? 'Partage de position actif' : 'Position invisible'}</strong><small>{sharing ? (sharing.mode === 'scheduled' ? shareIntervals.find(option => option.ms === sharing.intervalMs)?.label : shareModeLabels[sharing.mode]) : 'Vous gardez le contrôle'}</small></div></div></div><div className="map-bottom"><div className="map-card"><div className="map-card-head"><div><div className="section-kicker">VOTRE CERCLE</div><h2>Vos proches, tout près.</h2></div><span className="count-pill">{people.length} contacts</span></div><div className="map-people">{people.length ? people.map((person, index) => <div className="map-person-row" key={person.id}><Avatar person={person} index={index} /><div><strong>{person.name}</strong><small>{positions[person.id] ? `Position ${ago(positions[person.id].at)}` : 'Position non partagée'}</small></div><span className={`person-state ${positions[person.id] ? 'visible' : ''}`} /></div>) : <div className="empty-small">Invitez un proche pour commencer.</div>}</div><button className="text-link" onClick={() => selectTab('circle')}>Gérer mon cercle <ArrowRight size={16} /></button></div><div className="map-actions"><button className="share-location" onClick={async () => { if (sharing) { if (await stopSharing()) flash('Partage de position arrêté.'); } else { setSelectedIds([]); setShareModal(true); } }}><span className="share-icon"><Navigation size={21} /></span><span><strong>{sharing ? 'Arrêter le partage' : 'Partager ma position'}</strong><small>{sharing ? 'Interrompre maintenant' : 'Avec les proches choisis'}</small></span><ArrowRight size={20} /></button><div className="share-hint"><LockKeyhole size={14} /> Position chiffrée, visible seulement par les contacts choisis</div></div></div></div>}
+      {tab === 'map' && <div className="map-page"><div className="map-layer"><MapCanvas people={people} positions={positions} own={demo ? demoOwnPosition : ownPosition} ownName={user.name} trail={historyTrail} onPersonSelect={selectMapPerson} onLocate={locate} /></div><div className="map-top"><div className="map-title"><div className="eyebrow"><span className="eyebrow-dot" /> VOTRE MONDE EN UN COUP D’ŒIL</div><h1>On est mieux<br /><em>ensemble.</em></h1><p>Retrouvez les personnes qui choisissent de partager leur position avec vous.</p></div><div className="map-status"><span className={`status-light ${sharing ? 'on' : ''}`} /><div><strong>{sharing ? 'Partage de position actif' : 'Position invisible'}</strong><small>{sharing ? (sharing.mode === 'scheduled' ? shareIntervals.find(option => option.ms === sharing.intervalMs)?.label : shareModeLabels[sharing.mode]) : 'Vous gardez le contrôle'}</small></div></div></div>{historyPerson && <div className="map-history-panel"><div className="map-history-heading"><div><strong>Parcours de {historyPerson.name}</strong><small>Positions chiffrées · conservées 7 jours</small></div><button aria-label="Fermer le parcours" onClick={() => { setHistoryFrom(null); setHistoryTrail([]); }}><X size={16} /></button></div><div className="map-history-days"><button disabled={historyDay >= 6} onClick={() => setHistoryDay(day => day + 1)}>‹ Plus ancien</button><span>{historyDay === 0 ? 'Dernières 24 h' : `Il y a ${historyDay} à ${historyDay + 1} jours`}</span><button disabled={historyDay === 0} onClick={() => setHistoryDay(day => day - 1)}>Plus récent ›</button></div><small>{historyLoading ? 'Chargement du parcours…' : historyTrail.length ? `${historyTrail.length} positions sur cette période` : 'Aucune position sur cette période.'}</small></div>}<div className="map-bottom"><div className="map-card"><div className="map-card-head"><div><div className="section-kicker">VOTRE CERCLE</div><h2>Vos proches, tout près.</h2></div><span className="count-pill">{people.length} contacts</span></div><div className="map-people">{people.length ? people.map((person, index) => <div className="map-person-row" key={person.id}><Avatar person={person} index={index} /><div><strong>{person.name}</strong><small>{positions[person.id] ? `Position ${ago(positions[person.id].at)}` : 'Position non partagée'}</small></div><span className={`person-state ${positions[person.id] ? 'visible' : ''}`} /></div>) : <div className="empty-small">Invitez un proche pour commencer.</div>}</div><button className="text-link" onClick={() => selectTab('circle')}>Gérer mon cercle <ArrowRight size={16} /></button></div><div className="map-actions"><button className="share-location" onClick={async () => { if (sharing) { if (await stopSharing()) flash('Partage de position arrêté.'); } else { setSelectedIds([]); setShareModal(true); } }}><span className="share-icon"><Navigation size={21} /></span><span><strong>{sharing ? 'Arrêter le partage' : 'Partager ma position'}</strong><small>{sharing ? 'Interrompre maintenant' : 'Avec les proches choisis'}</small></span><ArrowRight size={20} /></button><div className="share-hint"><LockKeyhole size={14} /> Position chiffrée, visible seulement par les contacts choisis</div></div></div></div>}
 
       {tab === 'signals' && <div className="content-page signal-page"><div className="page-heading"><div className="eyebrow"><span className="eyebrow-dot" /> PETITS MOTS, GRAND LIEN</div><h1>Un signe suffit<span className="title-star"> ✳</span></h1><p>Ces phrases qu’on aimerait envoyer plus souvent. Sans pression, juste pour être là.</p></div><div className="signal-layout"><div className="signal-main"><div className="signal-feature"><div className="feature-head"><span className="feature-icon"><HeartPulse size={20} /></span><span>VOTRE SIGNAL DU JOUR</span></div><h2>Dire « je vais bien »,<br />en un seul geste.</h2><p>Un appui maintenu confirme votre présence et envoie un signal à vos contacts de confiance.</p><HoldButton duration={holdDuration} onComplete={holdConfirm} /><div className="last-check"><CheckCheck size={17} /> Dernière confirmation : {ago(checkinAt)}</div></div><div className="section-header"><div><div className="section-kicker">LES MOTS TOUT PRÊTS</div><h2>Qu’avez-vous envie de dire ?</h2></div><span className="subtle">À votre rythme</span></div><div className="phrase-grid">{phrases.map(item => <button key={item.text} className={`phrase-card tone-${item.tone}`} onClick={() => openSignal(item.text)}><span className="phrase-icon">{item.icon}</span><strong>{item.text}</strong><ArrowRight size={18} /></button>)}</div></div><aside className="signal-side"><div className="side-card"><div className="side-orbit">♡</div><h3>Un message simple peut faire toute la différence.</h3><p>Un signe pour rassurer. Un mot pour se rapprocher. Sans avoir à trouver la formule parfaite.</p></div><div className="side-tip"><LockKeyhole size={18} /><div><strong>Entre vous, vraiment.</strong><p>Seuls vos contacts approuvés peuvent recevoir vos signaux.</p></div></div></aside></div></div>}
 
@@ -340,7 +474,7 @@ export default function App() {
     </main>
     <nav className="mobile-nav">{nav.map(item => <button key={item.key} className={tab === item.key ? 'active' : ''} onClick={() => selectTab(item.key)}><item.icon size={22} /><span>{item.label}</span></button>)}</nav>
 
-    {(signalModal || shareModal) && <div className="modal-backdrop" onClick={() => { setSignalModal(null); setShareModal(false); }}><div className="choice-modal" onClick={e => e.stopPropagation()}><button className="icon-button close" onClick={() => { setSignalModal(null); setShareModal(false); }}><X size={20} /></button><div className="modal-badge">{shareModal ? <Navigation size={22} /> : <Heart size={22} />}</div><div className="section-kicker">CHOISIR LES DESTINATAIRES</div><h2>{shareModal ? 'Avec qui partager votre position ?' : signalModal}</h2><p>{shareModal ? shareDescription : 'Un petit signe, seulement aux personnes choisies.'}</p><div className="selection-list modal-list">{people.length ? people.map((person, index) => <label className="select-person" key={person.id}><Avatar person={person} index={index} /><span><strong>{person.name}</strong><small>@{person.handle}</small></span><input type="checkbox" checked={selectedIds.includes(person.id)} onChange={() => choose(person.id)} /></label>) : <div className="empty-small">Ajoutez d’abord des contacts dans votre cercle.</div>}</div><button className="button primary full" disabled={!selectedIds.length} onClick={async () => { try { if (shareModal) await startShare(); else { await sendEncrypted('pulse', signalModal!, selectedIds); setSignalModal(null); } } catch (error) { flash((error as Error).message); } }}>{shareModal ? 'Partager ma position' : `Envoyer à ${selectedIds.length} proche${selectedIds.length > 1 ? 's' : ''}`} <ArrowRight size={18} /></button></div></div>}
+    {(signalModal || shareModal) && <div className="modal-backdrop" onClick={() => { setSignalModal(null); setShareModal(false); }}><div className="choice-modal" onClick={e => e.stopPropagation()}><button className="icon-button close" onClick={() => { setSignalModal(null); setShareModal(false); }}><X size={20} /></button><div className="modal-badge">{shareModal ? <Navigation size={22} /> : <Heart size={22} />}</div><div className="section-kicker">CHOISIR LES DESTINATAIRES</div><h2>{shareModal ? 'Avec qui partager votre position ?' : signalModal}</h2><p>{shareModal ? shareDescription : 'Un petit signe, seulement aux personnes choisies.'}</p>{shareModal && <p className="share-retention-note">Positions chiffrées gardées 7 jours. Vos proches les reçoivent lorsqu’ils regardent la carte. Arrêter efface l’historique partagé.</p>}<div className="selection-list modal-list">{people.length ? people.map((person, index) => <label className="select-person" key={person.id}><Avatar person={person} index={index} /><span><strong>{person.name}</strong><small>@{person.handle}</small></span><input type="checkbox" checked={selectedIds.includes(person.id)} onChange={() => choose(person.id)} /></label>) : <div className="empty-small">Ajoutez d’abord des contacts dans votre cercle.</div>}</div><button className="button primary full" disabled={!selectedIds.length} onClick={async () => { try { if (shareModal) await startShare(); else { await sendEncrypted('pulse', signalModal!, selectedIds); setSignalModal(null); } } catch (error) { flash((error as Error).message); } }}>{shareModal ? 'Partager ma position' : `Envoyer à ${selectedIds.length} proche${selectedIds.length > 1 ? 's' : ''}`} <ArrowRight size={18} /></button></div></div>}
     {settingsOpen && <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}><div className="choice-modal settings-modal" onClick={e => e.stopPropagation()}><button className="icon-button close" onClick={() => setSettingsOpen(false)}><X size={20} /></button><div className="modal-badge"><Settings2 size={22} /></div><div className="section-kicker">VOTRE ESPACE</div><h2>Réglages</h2><div className="setting-row"><div><strong>Appui de confirmation</strong><small>Durée nécessaire pour envoyer « Je vais bien »</small></div><select value={holdDuration} onChange={e => { const value = Number(e.target.value); setHoldDuration(value); localStorage.setItem('halo.hold', String(value)); }}><option value={2}>2 s</option><option value={3}>3 s</option><option value={5}>5 s</option></select></div><LocationShareSettings mode={shareMode} intervalMs={shareIntervalMs} onModeChange={updateShareMode} onIntervalChange={updateShareInterval} /><div className="setting-row"><div><strong>Adresse du serveur</strong><small>Utilisez HTTPS sur iOS et Android</small></div></div><input className="server-input" placeholder="https://api.votre-domaine.fr" value={apiAddress} onChange={e => setApiAddress(e.target.value)} onBlur={() => setApiUrl(apiAddress)} /><button className="small-plain" onClick={() => { setApiUrl(apiAddress); flash('Adresse enregistrée.'); }}>Enregistrer l’adresse</button>{session && <div className="setting-row"><div><strong>Votre code de clé</strong><small>{fingerprint(session.user.publicKey)}</small></div><button className="icon-button" title="Copier" onClick={() => navigator.clipboard.writeText(fingerprint(session.user.publicKey))}><Copy size={17} /></button></div>}<div className="setting-warning">Les clés restent sur cet appareil. Une nouvelle installation ne peut pas relire les anciens messages.</div><button className="button secondary full" onClick={async () => { if (sharing) await stopSharing(); if (session) await api('/auth/logout', 'POST', {}, session.token).catch(() => {}); await saveSession(null); setSession(null); setDemo(false); setSettingsOpen(false); }}>Se déconnecter</button></div></div>}
     {toast && <div className="toast"><Check size={18} />{toast}</div>}
   </div>;

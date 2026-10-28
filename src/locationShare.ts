@@ -23,14 +23,15 @@ export function watchSharedLocation(
 
   const publish = async (position: Position, force = false) => {
     if (!active || sending || (!force && !due()) || (share.mode === 'on-open' && Date.now() - lastSentAt < 5_000)) return;
+    const recipients = share.ids.map(getContact).filter((person): person is Person => Boolean(person));
+    if (!recipients.length) { retryAt = Date.now() + 30_000; return; }
     sending = true;
     try {
-      await Promise.all(share.ids.map(async id => {
-        const person = getContact(id);
-        if (!person) throw new Error('Un contact choisi n’est plus disponible.');
+      await Promise.all(recipients.map(async person => {
         await api('/envelopes', 'POST', {
-          toId: id,
+          toId: person.id,
           kind: 'location',
+          shareId: share.shareId,
           mode: share.mode,
           intervalMs,
           ...seal({ lat: position.lat, lng: position.lng }, person.publicKey, session.secretKey),

@@ -9,7 +9,7 @@ export type AlertItem = { id: string; from: string; fromUser: Person; to: string
 export type Safety = { enabled: boolean; intervalHours: 12 | 24 | 48; contactIds: string[] };
 export type Session = { token: string; user: Person; secretKey: string };
 export type ShareMode = 'continuous' | 'on-open' | 'scheduled';
-export type ShareSession = { userId: string; ids: string[]; mode: ShareMode; intervalMs: number };
+export type ShareSession = { userId: string; shareId: string; ids: string[]; mode: ShareMode; intervalMs: number };
 
 const storageKey = 'halo.session';
 export const isNative = Capacitor.isNativePlatform();
@@ -30,6 +30,13 @@ export async function saveShareSession(share: ShareSession | null) {
 }
 export async function loadShareSession(): Promise<ShareSession | null> {
   try { return await SecureStorage.get('halo.sharing') as ShareSession | null; } catch { return null; }
+}
+export async function savePendingLocationRevoke(userId: string | null) {
+  if (userId) await SecureStorage.set('halo.locationRevokePending', userId);
+  else await SecureStorage.remove('halo.locationRevokePending');
+}
+export async function loadPendingLocationRevoke(): Promise<string | null> {
+  try { return await SecureStorage.get('halo.locationRevokePending') as string | null; } catch { return null; }
 }
 export function makeKeys() {
   const pair = nacl.box.keyPair();
