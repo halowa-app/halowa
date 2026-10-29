@@ -4,6 +4,7 @@ import { processQuery } from '../tgcloud/lib/core.js';
 import { parseCommand } from '../tgcloud/lib/protocol.js';
 import { accept, allow, decryptPosition, encryptPosition, getPosition, getSelfChatId, invite, newLocationKey, newSharingSession, parseAnswer, readLatestPosition, revoke, sendInlineCommand, startPosition, stopPosition, updatePosition } from '../client/protocol.mjs';
 import { receiveLocationKey, sendBipper, sendSecretText } from '../client/secretChats.mjs';
+import { SharingController } from '../client/sharing.mjs';
 
 function makeStore() {
   const contacts = new Map();
@@ -21,7 +22,7 @@ function makeStore() {
     async canRead(a, b) { return permissions.has(`${a}:${b}`); },
     async start(a, c, now) { const previous = positions.get(a); if (Math.abs(c.generation - now) > 300_000 || previous && previous.generation >= c.generation) return false; positions.set(a, { ownerId: a, ...c, active: true, updatedAt: now }); return true; },
     async update(a, c, now) { const previous = positions.get(a); if (!previous?.active || previous.epoch !== c.epoch || previous.sequence >= c.sequence) return false; positions.set(a, { ...previous, ciphertext: c.ciphertext, sequence: c.sequence, updatedAt: now }); return true; },
-    async stop(a, c, now) { const previous = positions.get(a); if (!previous?.active || previous.epoch !== c.epoch || previous.sequence >= c.sequence) return false; positions.set(a, { ...previous, ciphertext: null, sequence: c.sequence, active: false, updatedAt: now }); return true; },
+    async stop(a, c, now) { const previous = positions.get(a); if (!previous || previous.epoch !== c.epoch) return false; if (previous.active && previous.sequence < c.sequence) positions.set(a, { ...previous, ciphertext: null, sequence: c.sequence, active: false, updatedAt: now }); else if (previous.active || previous.sequence !== c.sequence) return false; for (const id of permissions) if (id.startsWith(`${a}:`)) permissions.delete(id); return true; },
     async read(a) { return positions.get(a); },
   };
 }
@@ -58,7 +59,9 @@ test('stop clears the point and delayed updates or starts cannot revive the same
   const payload = await encryptPosition(key, 45.75, 4.85, now);
   const start = startPosition(session, 15, payload);
   assert.equal(await processQuery(start, 1, store, now), 'H1:ok:started');
-  assert.equal(await processQuery(stopPosition(session), 1, store, now + 1), 'H1:ok:stopped');
+  const stop = stopPosition(session);
+  assert.equal(await processQuery(stop, 1, store, now + 1), 'H1:ok:stopped');
+  assert.equal(await processQuery(stop, 1, store, now + 1), 'H1:ok:stopped');
   assert.equal(store.positions.get(1).ciphertext, null);
   assert.equal(await processQuery(updatePosition(session, payload), 1, store, now + 2), 'H1:err:stale_update');
   assert.equal(await processQuery(start, 1, store, now + 3), 'H1:err:stale_start');
@@ -125,4 +128,26 @@ test('a location key is accepted only from the matching Secret Chat', async () =
   } };
   assert.deepEqual(await receiveLocationKey(tdlib, -2_000_000_000_007, 2, message), { ownerId: 2, epoch: 'sessionAAA', key });
   await assert.rejects(() => receiveLocationKey(tdlib, -2_000_000_000_007, 3, message));
+});
+
+test('sharing waits for Secret Chat key delivery and clears the server point on stop', async () => {
+  const store = makeStore();
+  const now = Date.now();
+  await processQuery(invite(2), 1, store, now);
+  await processQuery(accept(1), 2, store, now);
+  const events = [];
+  const client = new SharingController({
+    async query(command) { events.push(command.split(':')[1]); return parseAnswer(await processQuery(command, 1, store, Date.now())); },
+    async deliverKey(recipients, epoch, key) { events.push('key'); assert.equal(recipients[0].userId, 2); assert.ok(epoch && key); },
+    async save(value) { events.push('save'); assert.ok(value === null || value.key); },
+  });
+  await client.start([{ userId: 2 }], 15, { latitude: 48.85, longitude: 2.35, at: now });
+  assert.deepEqual(events.slice(0, 4), ['key', 'v', 's', 'save']);
+  const publishing = client.publish({ latitude: 48.86, longitude: 2.36, at: now + 15_000 });
+  const stopping = client.stop();
+  await Promise.all([publishing, stopping]);
+  assert.equal(store.positions.size, 1);
+  assert.equal(store.positions.get(1).ciphertext, null);
+  assert.equal(await store.canRead(1, 2), false);
+  await assert.rejects(() => client.publish({ latitude: 48.87, longitude: 2.37, at: now + 30_000 }));
 });

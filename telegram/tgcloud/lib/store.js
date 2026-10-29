@@ -89,7 +89,16 @@ export const store = {
       eq(latestPositions.active, true),
       lt(latestPositions.sequence, command.sequence),
     )).run();
-    return result.rowsAffected > 0;
+    if (result.rowsAffected > 0) {
+      await db.delete(permissions).where(eq(permissions.ownerId, ownerId)).run();
+      return true;
+    }
+    const previous = await this.read(ownerId);
+    if (previous?.epoch === command.epoch && !previous.active && previous.sequence === command.sequence) {
+      await db.delete(permissions).where(eq(permissions.ownerId, ownerId)).run();
+      return true;
+    }
+    return false;
   },
   async read(ownerId) {
     return await db.select().from(latestPositions).where(eq(latestPositions.ownerId, ownerId)).get();

@@ -2,18 +2,21 @@
 
 Ce dossier prépare une **application Halo autonome** qui utilise TDLib sur iOS et Android. Il ne crée pas de Mini App. Le bot Halo tourne sur Telegram Serverless et sa base SQLite intégrée. La version actuellement affichée par Vite utilise encore le backend local du dépôt : elle n'est pas déjà passée sur Telegram.
 
+**Accès actuel :** le bot Halo est créé, mais son propriétaire est sur la liste d'attente Serverless. Aucun déploiement ni essai réel du bot n'est possible avant l'activation de cette fonction. Les modules et le client peuvent être développés et testés localement pendant l'attente.
+
 ## Flux prévu
 
 1. Les deux personnes s'identifient avec leur compte Telegram dans Halo. Une invitation `i` puis une acceptation `a` établissent le contact. Le propriétaire autorise explicitement la lecture de sa position avec `v`.
 2. Quand le partage est activé, Halo crée une clé aléatoire de 256 bits et une session. Il transmet la clé à chaque contact choisi dans un **Secret Chat TDLib**. La clé reste dans le stockage sécurisé des téléphones. Après livraison des clés, Halo envoie au bot un point chiffré `s`, puis des remplacements `u` à la fréquence choisie. Une seule ligne de position existe par propriétaire. Le bot ne reçoit ni latitude ni longitude en clair.
 3. Le contact qui ouvre la carte envoie une requête inline `g` au bot ; le bot vérifie son identité Telegram et les autorisations SQL, puis lui renvoie le dernier blob chiffré. Halo le déchiffre localement. Aucune requête inline n'est sélectionnée ou envoyée dans un chat.
-4. L'arrêt `x` efface le blob. Une révocation `r` retire l'accès SQL. Avant tout nouveau partage avec un autre ensemble de contacts, Halo doit créer **une nouvelle clé** et la distribuer seulement aux personnes encore autorisées.
+4. L'arrêt `x` efface le blob et retire toutes les autorisations de lecture. Une révocation `r` retire l'accès SQL d'un seul contact. Avant tout nouveau partage avec un autre ensemble de contacts, Halo doit créer **une nouvelle clé** et la distribuer seulement aux personnes encore autorisées.
 5. Les messages ordinaires et les signaux bipper, après l'appui maintenu, passent directement de personne à personne dans des Secret Chats TDLib. Le bot n'y participe pas. La fonction d'envoi vérifie le type et l'état du Secret Chat avant d'envoyer.
 
 ## Ce qui est codé ici
 
 - `tgcloud/` : schéma SQLite, contrôle des contacts et autorisations, remplacement atomique de la dernière position, handler de requêtes inline.
 - `client/protocol.mjs` : création de session et de clé, chiffrement AES-GCM de la position, commandes compactes et lecture des réponses TDLib.
+- `client/sharing.mjs` : enchaînement côté téléphone de la distribution des clés, des autorisations, de la publication et de l'arrêt.
 - `client/secretChats.mjs` : contrôle d'un Secret Chat, envoi des textes bipper et distribution de clé.
 - `test/` : tests locaux du protocole, du chiffrement, de l'arrêt et du contrôle d'accès.
 
