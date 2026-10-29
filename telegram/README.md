@@ -1,34 +1,38 @@
-# Halo sur Telegram : prototype de migration
+# Halo Telegram migration
 
-Ce dossier prépare une **application Halo autonome** qui utilise TDLib sur iOS et Android. Il ne crée pas de Mini App. Le bot Halo tourne sur Telegram Serverless et sa base SQLite intégrée. La version actuellement affichée par Vite utilise encore le backend local du dépôt : elle n'est pas déjà passée sur Telegram.
+Halo is intended to be a standalone iOS and Android client, not a Telegram Mini App. The existing Vite interface still talks to the local Node API. The files in this directory prepare its replacement; they are **not yet connected to the production interface**.
 
-**Accès actuel :** le bot Halo est créé, mais son propriétaire est sur la liste d'attente Serverless. Aucun déploiement ni essai réel du bot n'est possible avant l'activation de cette fonction. Les modules et le client peuvent être développés et testés localement pendant l'attente.
+The Halo bot exists, but Telegram Serverless access is still waitlisted. The owner has not yet created an `api_id` and `api_hash` at `my.telegram.org`. No Serverless deployment or two-device integration test has taken place.
 
-## Flux prévu
+## Intended data flow
 
-1. Les deux personnes s'identifient avec leur compte Telegram dans Halo. Une invitation `i` puis une acceptation `a` établissent le contact. Le propriétaire autorise explicitement la lecture de sa position avec `v`.
-2. Quand le partage est activé, Halo crée une clé aléatoire de 256 bits et une session. Il transmet la clé à chaque contact choisi dans un **Secret Chat TDLib**. La clé reste dans le stockage sécurisé des téléphones. Après livraison des clés, Halo envoie au bot un point chiffré `s`, puis des remplacements `u` à la fréquence choisie. Une seule ligne de position existe par propriétaire. Le bot ne reçoit ni latitude ni longitude en clair.
-3. Le contact qui ouvre la carte envoie une requête inline `g` au bot ; le bot vérifie son identité Telegram et les autorisations SQL, puis lui renvoie le dernier blob chiffré. Halo le déchiffre localement. Aucune requête inline n'est sélectionnée ou envoyée dans un chat.
-4. L'arrêt `x` efface le blob et retire toutes les autorisations de lecture. Une révocation `r` retire l'accès SQL d'un seul contact. Avant tout nouveau partage avec un autre ensemble de contacts, Halo doit créer **une nouvelle clé** et la distribuer seulement aux personnes encore autorisées.
-5. Les messages ordinaires et les signaux bipper, après l'appui maintenu, passent directement de personne à personne dans des Secret Chats TDLib. Le bot n'y participe pas. La fonction d'envoi vérifie le type et l'état du Secret Chat avant d'envoyer.
+1. Each person signs into Telegram inside Halo through TDLib. An invitation and acceptance establish a contact. The owner separately approves access to their location.
+2. Starting a share creates a random 256-bit location key and session. The key is sent to each selected contact in a TDLib Secret Chat. After that delivery, Halo sends an encrypted latest-position blob to the Serverless bot through an inline query. Updates replace the previous blob; the bot never receives plaintext coordinates.
+3. When an approved contact opens the map, Halo asks the bot for the current encrypted blob through an inline query and decrypts it on the device. No position history is retained by this design.
+4. Stopping a share deletes the blob and access grants. Revoking one contact requires rotating the location key before any further update.
+5. Ordinary messages and press-and-hold bipper signals travel directly between devices in TDLib Secret Chats. The bot does not participate in these conversations.
 
-## Ce qui est codé ici
+## Implemented modules
 
-- `tgcloud/` : schéma SQLite, contrôle des contacts et autorisations, remplacement atomique de la dernière position, handler de requêtes inline.
-- `client/protocol.mjs` : création de session et de clé, chiffrement AES-GCM de la position, commandes compactes et lecture des réponses TDLib.
-- `client/sharing.mjs` : enchaînement côté téléphone de la distribution des clés, des autorisations, de la publication et de l'arrêt.
-- `client/secretChats.mjs` : contrôle d'un Secret Chat, envoi des textes bipper et distribution de clé.
-- `test/` : tests locaux du protocole, du chiffrement, de l'arrêt et du contrôle d'accès.
+- `tgcloud/`: proposed SQLite schema, authorization checks, atomic replacement of the latest position, and an inline-query handler.
+- `client/protocol.mjs`: location encryption, compact bot commands, and parsing of inline results.
+- `client/sharing.mjs`: ordering for key delivery, access grants, publication, and stopping a share.
+- `client/secretChats.mjs`: Secret Chat readiness checks and message/key delivery helpers.
+- `test/`: local tests for protocol behavior, encryption, stopping, and authorization.
+- `../src/telegram/`: typed Capacitor bridge, TDLib database key in device secure storage, and a preparatory account sign-in screen.
+- `../android/app/src/main/`: an Android Capacitor plugin and JNI wrapper for TDLib's JSON C API. It becomes available only when a compatible `libtdjson.so` is supplied.
+- `../ios/App/App/`: an iOS Capacitor plugin that looks up TDLib's JSON C symbols. It becomes available only after a compatible signed TDLib framework or dylib is linked or bundled.
 
-## Ce qu'il reste à brancher pour l'utiliser sur téléphone
+## Remaining integration
 
-- Créer ou activer le bot Halo dans **@BotFather**, activer **Serverless** et le mode **inline**. Installer la CLI dans ce dossier avec `npm install`, lier le bot localement avec `npx tgcloud login`, puis déployer avec `npx tgcloud push` et créer les tables avec `npx tgcloud migrate`. Ne jamais commiter `.tgcloud/`, un jeton de bot, un `api_hash` ou une clé privée.
-- Obtenir les identifiants d'application Telegram (`api_id` / `api_hash`) via `my.telegram.org`, intégrer TDLib dans les projets natifs Android et iOS, puis relier le client TDLib à l'interface Capacitor existante. Un Secret Chat est lié à un appareil : le destinataire doit l'accepter sur celui où Halo est installé.
-- Faire dépendre le suivi en arrière-plan du service natif de localisation et d'un transport TDLib persistant. Le JavaScript de la WebView ne peut pas garantir l'envoi quand iOS suspend l'application. Le mode 15 s reste un **objectif à mesurer** sur appareils réels ; Telegram peut limiter les requêtes inline et iOS/Android peuvent retarder les relevés.
-- Ajouter la gestion locale persistante des clés, l'arrivée des invitations et des clés dans les Secret Chats, la vérification visuelle des clés de chat et la rotation de clé lors d'une révocation. Puis migrer les écrans et retirer l'ancien backend et l'ancien historique de sept jours.
+- Enable Serverless and inline mode for the bot, then deploy the schema and handler using the supported Telegram tooling after waitlist access is granted. The handler has not been tested against a live Serverless runtime.
+- Obtain an application `api_id` and `api_hash` from `my.telegram.org`. Do not put the hash, bot token, database key, or private keys in Git.
+- Build and package compatible TDLib binaries for Android and iOS. Validate both native bridges on real devices; iOS has not been compiled on this Windows machine. Complete the remaining account authorization states, contact approval flow, Secret Chat key verification, receiving and storing shared location keys, key rotation, and migration of the existing screens.
+- Move background location publication into a native service. JavaScript in the WebView cannot guarantee delivery while iOS suspends the app. A 15-second interval is a target requiring real-device measurement, not a guarantee.
+- Test inline-query size, rate limits, and delivery using two accounts and devices. Telegram documents inline results, but does not guarantee this use as a 15-second synchronization channel.
 
-La réponse chiffrée est placée dans la `description` d'un résultat inline. La documentation Telegram permet de lire des résultats inline sans envoyer de message, mais ne garantit pas cet usage comme canal de synchronisation à 15 secondes. Il faut le valider avec deux comptes et deux appareils avant d'en faire l'architecture finale.
+The former Node API remains a local prototype and is still required by the current interface. It now keeps only each contact pair's latest encrypted position.
 
-## Vérification locale
+## Local checks
 
-Depuis ce dossier : `node --test test/protocol.test.mjs`.
+Run `node --test test/protocol.test.mjs` from this directory. Run the root build and server tests from the repository root.

@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from
 import { readFile, writeFile, rename } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { createLocationStore, HISTORY_MS } from './location-store.mjs';
+import { createLocationStore } from './location-store.mjs';
 
 const dataFile = process.env.DATA_FILE || path.join(path.dirname(fileURLToPath(import.meta.url)), 'data.json');
 const locationFile = process.env.LOCATION_DB_FILE || `${dataFile}.locations.sqlite`;
@@ -188,17 +188,6 @@ async function route(req, res) {
       if (!subscribers.size) viewers.delete(user.id);
     });
     return;
-  }
-  if (method === 'GET' && p === '/api/location/history') {
-    const senderId = url.searchParams.get('from');
-    if (!senderId || !isContact(user.id, senderId)) fail(403, 'Contact non approuvé.');
-    const now = Date.now();
-    if (!locations.latestFor(user.id, now, maySeeLocation).some(item => item.from === senderId)) return json(res, 200, { envelopes: [] });
-    const requestedSince = Number(url.searchParams.get('since'));
-    const requestedBefore = Number(url.searchParams.get('before'));
-    const since = Number.isFinite(requestedSince) && requestedSince > 0 ? Math.max(now - HISTORY_MS, requestedSince) : now - HISTORY_MS;
-    const before = Number.isFinite(requestedBefore) && requestedBefore > 0 ? Math.min(now + 1, requestedBefore) : now + 1;
-    return json(res, 200, { envelopes: locations.historyFor(user.id, senderId, since, before, 1440) });
   }
   if (method === 'GET' && p === '/api/envelopes') {
     const after = Math.max(0, Number(url.searchParams.get('after')) || 0);

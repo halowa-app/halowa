@@ -4,8 +4,9 @@ function requireOk(answer, expected) {
   if (answer?.kind !== 'ok' || answer.code !== expected) throw new Error(`Halo bot rejected ${expected}: ${answer?.code ?? 'no response'}`);
 }
 
-// `query` sends one invisible inline query. `deliverKey` must resolve only after
-// TDLib confirms the Secret Chat message was sent. `save` must use secure storage.
+// `query` sends one invisible inline query. `deliverKey` must wait for TDLib's
+// send-success update for every recipient and reject on failure. `save` must
+// use secure storage.
 export class SharingController {
   constructor({ query, deliverKey, save }) {
     this.query = query;

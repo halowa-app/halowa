@@ -16,14 +16,36 @@ export async function requireReadySecretChat(tdlib, chatId, expectedUserId) {
 export async function sendSecretText(tdlib, chatId, expectedUserId, text) {
   if (typeof text !== 'string' || !text.trim() || text.length > 1000) throw new Error('Invalid message.');
   await requireReadySecretChat(tdlib, chatId, expectedUserId);
-  return await tdlib.send({
+  const updates = [];
+  let consume = update => updates.push(update);
+  const unsubscribe = typeof tdlib.subscribe === 'function' ? tdlib.subscribe(update => consume(update)) : null;
+  try {
+    const queued = await tdlib.send({
     '@type': 'sendMessage', chat_id: chatId, topic_id: null, reply_to: null,
     options: null, reply_markup: null,
     input_message_content: {
       '@type': 'inputMessageText', text: { '@type': 'formattedText', text, entities: [] },
       link_preview_options: null, clear_draft: false,
     },
-  });
+    });
+    if (!unsubscribe || queued?.sending_state?.['@type'] !== 'messageSendingStatePending') return queued;
+    return await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Secret Chat send confirmation timed out.')), 30_000);
+      consume = update => {
+        if (update?.old_message_id !== queued.id || update?.message?.chat_id !== chatId) return;
+        if (update['@type'] === 'updateMessageSendSucceeded') {
+          clearTimeout(timeout);
+          resolve(update.message);
+        } else if (update['@type'] === 'updateMessageSendFailed') {
+          clearTimeout(timeout);
+          reject(new Error(update.error?.message || 'Secret Chat message failed to send.'));
+        }
+      };
+      for (const update of updates) consume(update);
+    });
+  } finally {
+    unsubscribe?.();
+  }
 }
 
 export async function sendBipper(tdlib, recipients, preset) {
@@ -37,7 +59,7 @@ export async function shareLocationKey(tdlib, recipients, epoch, key) {
   // Secret Chats provide the end-to-end encrypted transport. The key itself
   // is used only to encrypt position blobs later sent to the Serverless bot.
   if (!/^[A-Za-z0-9_-]{8,32}$/.test(epoch) || !/^[A-Za-z0-9_-]{43}$/.test(key)) throw new Error('Invalid sharing key.');
-  return await Promise.allSettled(recipients.map(({ chatId, userId }) => sendSecretText(tdlib, chatId, userId, `HALO-LOCATION-KEY:1:${epoch}:${key}`)));
+  return await Promise.all(recipients.map(({ chatId, userId }) => sendSecretText(tdlib, chatId, userId, `HALO-LOCATION-KEY:1:${epoch}:${key}`)));
 }
 
 export async function receiveLocationKey(tdlib, chatId, expectedOwnerId, message) {

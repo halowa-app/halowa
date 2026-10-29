@@ -16,3 +16,4 @@ android/.gradle
 android/local.properties
 ios/Pods
 .tgcloud/
+android/app/src/main/jniLibs/

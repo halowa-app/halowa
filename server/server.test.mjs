@@ -4,6 +4,8 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import { createLocationStore } from './location-store.mjs';
 
 const directory = await mkdtemp(path.join(tmpdir(), 'halo-server-'));
 process.env.DATA_FILE = path.join(directory, 'data.json');
@@ -35,10 +37,10 @@ test('approval gates encrypted chat and location; missed check-in alerts trusted
   await request('/envelopes', 'POST', location, a.body.token);
   const received = (await request('/envelopes', 'GET', undefined, b.body.token)).body.envelopes;
   assert.equal(received.length, 1);
-  assert.equal((await request('/location/history', 'GET', undefined, a.body.token)).status, 403);
-  const firstHistory = (await request(`/location/history?from=${a.body.user.id}`, 'GET', undefined, b.body.token)).body.envelopes;
-  assert.equal(firstHistory.length, 1);
-  assert.equal(firstHistory[0].expires - firstHistory[0].at, 12 * 60 * 60_000 + 5 * 60_000);
+  assert.equal((await request('/location/history', 'GET', undefined, b.body.token)).status, 404);
+  const firstLatest = locations.latestFor(b.body.user.id, Date.now(), () => true);
+  assert.equal(firstLatest.length, 1);
+  assert.equal(firstLatest[0].expires - firstLatest[0].at, 12 * 60 * 60_000 + 5 * 60_000);
   const streamController = new AbortController();
   const stream = await fetch(`${base}/location/stream`, { headers: { Authorization: `Bearer ${b.body.token}` }, signal: streamController.signal });
   assert.equal(stream.status, 200);
@@ -46,27 +48,27 @@ test('approval gates encrypted chat and location; missed check-in alerts trusted
   const reader = stream.body.getReader();
   const snapshot = new TextDecoder().decode((await reader.read()).value);
   assert.match(snapshot, /event: snapshot/);
-  assert.match(snapshot, new RegExp(firstHistory[0].id));
+  assert.match(snapshot, new RegExp(firstLatest[0].id));
   assert.equal((await request('/envelopes', 'POST', { ...location, mode: 'on-open' }, a.body.token)).status, 201);
   const pushed = new TextDecoder().decode((await reader.read()).value);
   assert.match(pushed, /event: location/);
-  const latest = (await request(`/location/history?from=${a.body.user.id}`, 'GET', undefined, b.body.token)).body.envelopes;
+  const latest = locations.latestFor(b.body.user.id, Date.now(), () => true);
   assert.equal(latest.length, 1);
   const opened = latest.at(-1);
-  assert.notEqual(opened.id, firstHistory[0].id);
+  assert.notEqual(opened.id, firstLatest[0].id);
   assert.equal(opened.expires - opened.at, 24 * 60 * 60_000);
   await request('/location/revoke', 'POST', {}, a.body.token);
   assert.match(new TextDecoder().decode((await reader.read()).value), /event: revoke/);
   streamController.abort();
   assert.equal((await request('/envelopes', 'POST', location, a.body.token)).status, 403);
-  assert.equal((await request(`/location/history?from=${a.body.user.id}`, 'GET', undefined, b.body.token)).body.envelopes.length, 0);
+  assert.equal(locations.latestFor(b.body.user.id, Date.now(), () => true).length, 0);
   assert.equal((await request('/envelopes', 'GET', undefined, b.body.token)).body.envelopes.length, 1);
   const restarted = { ...location, shareId: randomUUID() };
   assert.equal((await request('/location/start', 'POST', { shareId: restarted.shareId, ids: [b.body.user.id] }, a.body.token)).status, 200);
   assert.equal((await request('/envelopes', 'POST', location, a.body.token)).status, 403);
   await request('/envelopes', 'POST', restarted, a.body.token);
   await sweep(Date.now() + 8 * 864e5);
-  assert.equal((await request(`/location/history?from=${a.body.user.id}`, 'GET', undefined, b.body.token)).body.envelopes.length, 0);
+  assert.equal(locations.latestFor(b.body.user.id, Date.now(), () => true).length, 0);
   const config = await request('/safety', 'POST', { enabled: true, intervalHours: 12, contactIds: [b.body.user.id] }, a.body.token);
   assert.equal(config.status, 200);
   await sweep(config.body.checkinAt + 14 * 36e5 + 1000);
@@ -76,5 +78,27 @@ test('approval gates encrypted chat and location; missed check-in alerts trusted
   await request(`/contacts/${b.body.user.id}`, 'DELETE', undefined, a.body.token);
   assert.equal((await request('/alerts', 'GET', undefined, b.body.token)).body.alerts.length, 0);
   assert.equal((await request('/envelopes', 'POST', restarted, a.body.token)).status, 403);
+});
+
+test('a legacy history database is reduced to one encrypted point per contact', () => {
+  const filename = path.join(directory, 'legacy.sqlite');
+  const legacy = new DatabaseSync(filename);
+  legacy.exec(`CREATE TABLE locations (
+    id TEXT PRIMARY KEY, from_id TEXT NOT NULL, to_id TEXT NOT NULL,
+    nonce TEXT NOT NULL, ciphertext TEXT NOT NULL, mode TEXT NOT NULL,
+    interval_ms INTEGER NOT NULL, at INTEGER NOT NULL, expires INTEGER NOT NULL
+  )`);
+  const insert = legacy.prepare('INSERT INTO locations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  const now = Date.now();
+  insert.run('old', 'a', 'b', 'nonce', 'old-ciphertext', 'scheduled', 15_000, now - 30_000, now + 60_000);
+  insert.run('new', 'a', 'b', 'nonce', 'new-ciphertext', 'scheduled', 15_000, now, now + 60_000);
+  legacy.close();
+  const migrated = createLocationStore(filename);
+  assert.deepEqual(migrated.latestFor('b', now, () => true).map(item => item.id), ['new']);
+  migrated.close();
+  const reopened = new DatabaseSync(filename);
+  assert.equal(reopened.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'locations'").get().n, 0);
+  assert.equal(reopened.prepare('SELECT count(*) AS n FROM latest_locations').get().n, 1);
+  reopened.close();
 });
 test.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); locations.close(); await rm(directory, { recursive: true, force: true }); });

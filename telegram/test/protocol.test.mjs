@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { processQuery } from '../tgcloud/lib/core.js';
 import { parseCommand } from '../tgcloud/lib/protocol.js';
 import { accept, allow, decryptPosition, encryptPosition, getPosition, getSelfChatId, invite, newLocationKey, newSharingSession, parseAnswer, readLatestPosition, revoke, sendInlineCommand, startPosition, stopPosition, updatePosition } from '../client/protocol.mjs';
-import { receiveLocationKey, sendBipper, sendSecretText } from '../client/secretChats.mjs';
+import { receiveLocationKey, sendBipper, sendSecretText, shareLocationKey } from '../client/secretChats.mjs';
 import { SharingController } from '../client/sharing.mjs';
 
 function makeStore() {
@@ -128,6 +128,32 @@ test('a location key is accepted only from the matching Secret Chat', async () =
   } };
   assert.deepEqual(await receiveLocationKey(tdlib, -2_000_000_000_007, 2, message), { ownerId: 2, epoch: 'sessionAAA', key });
   await assert.rejects(() => receiveLocationKey(tdlib, -2_000_000_000_007, 3, message));
+});
+
+test('location key delivery fails if a recipient cannot receive the Secret Chat message', async () => {
+  const tdlib = { async send(input) {
+    if (input['@type'] === 'getChat') return { type: { '@type': 'chatTypeSecret', user_id: input.chat_id, secret_chat_id: 7 } };
+    if (input['@type'] === 'getSecretChat') return { state: { '@type': 'secretChatStateReady' } };
+    throw new Error('Message send failed');
+  } };
+  await assert.rejects(() => shareLocationKey(tdlib, [{ chatId: 2, userId: 2 }], 'sessionAAA', newLocationKey()), /Message send failed/);
+});
+
+test('Secret Chat send waits for TDLib success instead of treating a queued message as delivered', async () => {
+  let listener;
+  const tdlib = {
+    subscribe(callback) { listener = callback; return () => { listener = null; }; },
+    async send(input) {
+      if (input['@type'] === 'getChat') return { type: { '@type': 'chatTypeSecret', user_id: 2, secret_chat_id: 7 } };
+      if (input['@type'] === 'getSecretChat') return { state: { '@type': 'secretChatStateReady' } };
+      return { id: 88, chat_id: 9, sending_state: { '@type': 'messageSendingStatePending' } };
+    },
+  };
+  const sending = sendSecretText(tdlib, 9, 2, 'Je vais bien.');
+  await new Promise(resolve => setImmediate(resolve));
+  listener({ '@type': 'updateMessageSendSucceeded', old_message_id: 88, message: { id: 99, chat_id: 9 } });
+  assert.deepEqual(await sending, { id: 99, chat_id: 9 });
+  assert.equal(listener, null);
 });
 
 test('sharing waits for Secret Chat key delivery and clears the server point on stop', async () => {
